@@ -55,6 +55,7 @@
       "@strands-agents/sdk>zod": "^4.4.3",
       "@ag-ui/aws-strands>zod": "^4.4.3",
       "@ag-ui/aws-strands-examples>zod": "^4.4.3",
+      "@github/copilot-sdk>zod": "^4.3.6",
       "hono": "4.12.27"
     }
   }

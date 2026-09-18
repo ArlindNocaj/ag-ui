@@ -88,10 +88,14 @@ function InterruptHumanInTheLoop<TAgent extends AvailableAgents>({
   event,
   resolve,
 }: {
-  event: { value: InterruptEvent<TAgent> };
+  event: {
+    value: InterruptEvent<TAgent> | { metadata?: { reason?: InterruptEvent<TAgent> } };
+  };
   resolve: (value: string) => void;
 }) {
-  const { message, options, agent, recommendation } = event.value;
+  const payload = "options" in event.value ? event.value : event.value.metadata?.reason;
+  if (!payload) return null;
+  const { message, options, agent, recommendation } = payload;
 
   // Format agent name with emoji
   const formatAgentName = (agent: string) => {

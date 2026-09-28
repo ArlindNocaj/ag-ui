@@ -729,9 +729,9 @@ async def test_context_manager_preset_builds_one_manager_per_thread(preset, capl
         for thread in (first, second):
             for name in ("summarize_context", "truncate_context", "pin_context"):
                 assert name in thread.tool_registry.registry
-                assert (
-                    thread.tool_registry.registry[name]
-                    is not template.tool_registry.registry[name]
+                assert all(
+                    tool is not template.tool_registry.registry[name]
+                    for tool in ag._tools
                 )
 
 

@@ -4124,22 +4124,21 @@ class StrandsAgent:
                 ", ".join(unreadable),
             )
         if template_owned:
-            # ``plugins`` is the one of these with a dedicated kwarg, so point
-            # at it rather than making every caller write a hook for the case
-            # the adapter already has an answer to.
-            route = (
-                "Pass them to StrandsAgent(plugins=[...])"
-                if template_owned == ["plugins"]
-                else "Supply them per thread with "
-                "StrandsAgentConfig.thread_agent_kwargs"
-            )
+            routes = []
+            if "plugins" in template_owned:
+                routes.append("Pass plugins to StrandsAgent(plugins=[...])")
+            if any(name != "plugins" for name in template_owned):
+                routes.append(
+                    "Supply the other settings per thread with "
+                    "StrandsAgentConfig.thread_agent_kwargs"
+                )
             logger.warning(
                 "these Agent constructor params are consumed by the Strands Agent "
                 "that received them and cannot be handed to another agent, so a "
                 "value set on the template will not reach per-thread agents: %s. "
                 "%s.",
                 ", ".join(template_owned),
-                route,
+                "; ".join(routes),
             )
 
     async def run(

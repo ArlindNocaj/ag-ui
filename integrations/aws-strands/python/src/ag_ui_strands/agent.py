@@ -375,12 +375,38 @@ def _extract_agent_kwargs(
     kwargs: dict = {}
     unreadable: List[str] = []
     template_owned: List[str] = []
-    for name, annotation in _forwardable_parameters():
-        value = _resolve_template_param(agent, name, annotation)
+    parameters = _forwardable_parameters()
+    context_manager = next(
+        (
+            _resolve_template_param(agent, name, annotation)
+            for name, annotation in parameters
+            if name == "context_manager"
+        ),
+        _MISSING,
+    )
+    for name, annotation in parameters:
+        # Strands resolves context_manager into a per-agent plugin and replaces
+        # conversation_manager with an internal no-op. Neither belongs to the
+        # next agent; its own constructor must resolve both settings afresh.
+        if (
+            name == "conversation_manager"
+            and context_manager is not _MISSING
+            and context_manager is not None
+            and context_manager is not False
+        ):
+            continue
+        value = (
+            context_manager
+            if name == "context_manager"
+            else _resolve_template_param(agent, name, annotation)
+        )
         if value is _MISSING:
             unreadable.append(name)
             continue
         if value is _AGENT_BOUND:
+            template_owned.append(name)
+            continue
+        if name == "context_manager" and not isinstance(value, (str, dict, bool)):
             template_owned.append(name)
             continue
         if value is None:
@@ -3440,8 +3466,11 @@ class StrandsAgent:
         if self._orchestrator is None:
             self._model = agent.model
             self._system_prompt = agent.system_prompt
-            # A plugin's tool can retain a callback bound to the template's
-            # manager even when that manager is excluded from the kwargs.
+            # The resolved context manager contributes tools closed over its
+            # stash; agentic mode also injects tools before plugin registration.
+            # Neither set belongs in a new agent's tool list.
+            context_manager = getattr(agent, "context_manager", None)
+            manager_tools = getattr(context_manager, "tools", ())
             self._tools = [
                 tool
                 for tool in (
@@ -3453,6 +3482,10 @@ class StrandsAgent:
                     getattr(getattr(tool, "_tool_func", None), "__self__", None),
                     agent,
                 )
+                and all(tool is not manager_tool for manager_tool in manager_tools)
+                and not getattr(
+                    getattr(tool, "_tool_func", None), "__module__", ""
+                ).startswith("strands._context_manager.")
             ]
             (
                 self._agent_kwargs,

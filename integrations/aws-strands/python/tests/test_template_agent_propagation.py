@@ -670,6 +670,71 @@ async def test_template_session_manager_is_dropped_and_warns(caplog):
     assert instance.init_kwargs.get("session_manager") is None
 
 
+@pytest.mark.skipif(
+    "context_manager" not in inspect.signature(Agent.__init__).parameters,
+    reason="this Strands release has no context manager",
+)
+@pytest.mark.asyncio
+async def test_template_context_manager_and_its_tools_are_not_reused(caplog):
+    template = Agent(model=_mock_model(), context_manager="auto")
+    manager_tools = template.context_manager.tools
+    assert manager_tools, "the fixture must exercise manager-generated tools"
+
+    ag = StrandsAgent(template, name="test")
+    assert "context_manager" in ag._template_owned_params
+    assert "context_manager" not in ag._agent_kwargs
+    assert "conversation_manager" not in ag._agent_kwargs
+    assert all(
+        tool is not manager_tool
+        for tool in ag._tools
+        for manager_tool in manager_tools
+    )
+
+    with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
+        with patch("ag_ui_strands.agent.StrandsAgentCore", _CapturingCore):
+            instance = await _trigger_thread_creation(ag, "t1")
+
+    assert "context_manager" not in instance.init_kwargs
+    assert any(
+        "context_manager" in message and "thread_agent_kwargs" in message
+        for message in caplog.messages
+    )
+
+
+@pytest.mark.skipif(
+    "context_manager" not in inspect.signature(Agent.__init__).parameters,
+    reason="this Strands release has no context manager",
+)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preset", ["auto", "agentic"])
+async def test_context_manager_preset_builds_one_manager_per_thread(preset, caplog):
+    from ag_ui_strands.config import StrandsAgentConfig
+
+    template = Agent(model=_mock_model(), context_manager=preset)
+    config = StrandsAgentConfig(
+        thread_agent_kwargs=lambda _input: {"context_manager": preset}
+    )
+    ag = StrandsAgent(template, name="test", config=config)
+
+    with caplog.at_level(logging.WARNING, logger="ag_ui_strands.agent"):
+        first = await _trigger_thread_creation(ag, "first")
+        second = await _trigger_thread_creation(ag, "second")
+
+    assert first.context_manager is not template.context_manager
+    assert second.context_manager is not template.context_manager
+    assert first.context_manager is not second.context_manager
+    assert first.context_manager.stash is not second.context_manager.stash
+    assert not any("context_manager" in message for message in caplog.messages)
+    if preset == "agentic":
+        for thread in (first, second):
+            for name in ("summarize_context", "truncate_context", "pin_context"):
+                assert name in thread.tool_registry.registry
+                assert (
+                    thread.tool_registry.registry[name]
+                    is not template.tool_registry.registry[name]
+                )
+
+
 def test_template_session_manager_no_warning_when_provider_set(caplog):
     """With a provider configured, the warning should NOT fire."""
     from ag_ui_strands.config import StrandsAgentConfig

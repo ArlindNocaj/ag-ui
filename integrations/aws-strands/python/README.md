@@ -82,7 +82,7 @@ The integration has three main layers:
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md) for diagrams and a deeper dive.
 
-## Per-thread agents: hooks and plugins
+## Per-thread agents: hooks, plugins, and context management
 
 The wrapper does not run the agent you hand it. That one is a template: the
 adapter reads its constructor settings back off the instance and builds a fresh
@@ -110,6 +110,25 @@ the first time a thread is built, rather than dropping it in silence. For a
 value that has to differ per thread, build it in
 `StrandsAgentConfig.thread_agent_kwargs`, which runs per request and wins over
 both routes above.
+
+Newer Strands versions also resolve `context_manager="auto"` or `"agentic"`
+into a stateful plugin on the template. The adapter cannot recover the original
+preset from that plugin or safely share its stash and tools with other threads.
+It does not forward the resolved manager or its generated tools, and warns if
+the template has one. Supply the original setting per thread instead:
+
+```python
+agui_agent = StrandsAgent(
+    agent=strands_agent,
+    name="my_agent",
+    config=StrandsAgentConfig(
+        thread_agent_kwargs=lambda _input: {"context_manager": "auto"}
+    ),
+)
+```
+
+Use `"agentic"` in place of `"auto"` if that was the template's preset.
+The per-thread constructor creates an independent manager for each thread.
 
 | Scenario                                            | Support boundary                                                                                                                                                                       |
 | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

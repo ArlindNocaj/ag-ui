@@ -28,8 +28,8 @@ Register and reuse a long-lived `CopilotAgent` when hosting directly in CopilotK
 Per-request `clone()` instances share its native sessions and pending tool calls,
 while separately constructed agents remain independent. Call `close()` at host
 shutdown, not after each request: closing any clone closes the family's sessions.
-Sessions and pending calls remain process-local; cloning does not provide recovery
-after a restart or continuation on another server process.
+Recovery records and pending calls remain process-local; cloning does not provide
+recovery after a restart or continuation on another server process.
 
 ## Features
 
@@ -47,11 +47,25 @@ after a restart or continuation on another server process.
 | `model` | `gpt-5.4-mini` | Copilot model id |
 | `instructions` | — | Appended to the system message |
 | `tools` | `[]` | Server-side tools the model may call directly |
-| `sessionConfig` | `{}` | Passed through to `createSession` |
+| `sessionConfig` | `{}` | Passed through to create and resume (excluding create-only options on resume) |
 | `predictState` | — | `[{state_key, tool, tool_argument}]` emitted as `CUSTOM PredictState` |
 | `interrupts` | `{}` | Maps a handler-less tool's browser answer into the original pending RPC result |
 | `runTimeoutMs` | `120000` | Wall-clock budget per run; on expiry the native work is abandoned and the run ends with `RUN_ERROR` |
 | `maxPendingTools` | `32` | Bounds the in-process pending-tool registry |
+| `maxThreads` | `1000` | Positive-integer live-session retention target; active runs and pending tools may exceed it |
+
+Idle sessions above `maxThreads` are disconnected without aborting their work.
+Returning threads use the native SDK's `resumeSession` with the original
+session ID; old user messages and completed tool results are not sent again.
+If all sessions are active or awaiting a frontend-tool/interrupt answer, new
+runs are accepted and idle sessions are trimmed later.
+
+The adapter retains recovery IDs until `close()`, separately from live-session
+resources. Those records grow with the number of conversations and sent-message
+IDs. Recovery is same-process only and requires available native session
+history; a failed resume emits `RUN_ERROR` rather than starting fresh.
+Custom `CopilotClientPort` implementations need `resumeSession` for recovery.
+See [session retention and recovery](../README.md#session-retention-and-recovery).
 
 ## Examples
 

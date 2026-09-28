@@ -31,8 +31,6 @@ from .mapper import EventMapper
 
 logger = logging.getLogger(__name__)
 
-#: Native sessions are process-local; a restart drops suspended tool calls.
-MAX_THREADS = 32
 #: Quiet period after a pending tool request before handing off to the browser.
 HANDOFF_DELAY = 0.05
 
@@ -71,8 +69,12 @@ class _Pending:
 
 @dataclass
 class _Thread:
-    mapper: EventMapper = field(default_factory=EventMapper)
+    mapper: EventMapper | None = None
     session: Any = None
+    session_id: str | None = None
+    opening: asyncio.Task | None = None
+    eviction: asyncio.Task | None = None
+    closed: bool = False
     #: AG-UI toolCallId -> the suspended external tool call this process still holds.
     pending: dict[str, _Pending] = field(default_factory=dict)
     sent_user_ids: set[str] = field(default_factory=set)
@@ -170,6 +172,7 @@ class CopilotAgent:
         interrupts: dict[str, Callable[[Any, Any], Any]] | None = None,
         run_timeout: float = 120.0,
         max_pending_tools: int = 32,
+        max_threads: int = 1000,
     ):
         """
         ``predict_state`` entries (``{"state_key", "tool", "tool_argument"}``) are
@@ -179,6 +182,8 @@ class CopilotAgent:
         outcome instead of a plain finish; the function maps the client's resume
         payload to the result the model sees when the paused call continues.
         """
+        if type(max_threads) is not int or max_threads < 1:
+            raise ValueError("max_threads must be a positive integer")
         self.client = client
         self.name = name
         self.model = model
@@ -189,21 +194,70 @@ class CopilotAgent:
         self.interrupts = interrupts or {}
         self.run_timeout = run_timeout
         self.max_pending_tools = max_pending_tools
+        self.max_threads = max_threads
         self._threads: dict[str, _Thread] = {}
 
     async def close(self) -> None:
         for thread_id in list(self._threads):
             await self._dispose(thread_id)
 
-    async def _dispose(self, thread_id: str) -> None:
-        thread = self._threads.pop(thread_id, None)
-        if thread is None or thread.session is None:
+    async def _dispose(self, thread_id: str, thread: _Thread | None = None) -> None:
+        thread = thread or self._threads.get(thread_id)
+        if thread is None:
+            return
+        thread.closed = True
+        if self._threads.get(thread_id) is thread:
+            self._threads.pop(thread_id)
+        transitions = [t for t in (thread.opening, thread.eviction) if t is not None]
+        if transitions:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.gather(*transitions, return_exceptions=True)), 5
+                )
+            except TimeoutError:
+                logger.warning("Session cleanup timed out")
+        if thread.session is None:
             return
         for closer in (thread.session.abort, thread.session.disconnect):
             try:
                 await asyncio.wait_for(closer(), 5)
             except Exception:  # noqa: BLE001, S110 -- cleanup is best effort.
                 pass
+
+    async def _trim(self) -> None:
+        # ponytail: scan recovery records too; index live entries if long histories make this costly.
+        excess = sum(
+            t.session is not None and t.eviction is None for t in self._threads.values()
+        ) - self.max_threads
+        evictions = []
+        for thread in self._threads.values():
+            if excess <= 0:
+                break
+            if (
+                thread.session is None or thread.busy or thread.pending
+                or thread.eviction is not None or thread.closed
+            ):
+                continue
+            thread.eviction = asyncio.create_task(self._evict(thread))
+            evictions.append(thread.eviction)
+            excess -= 1
+        if evictions:
+            try:
+                await asyncio.wait_for(asyncio.shield(asyncio.gather(*evictions)), 5)
+            except TimeoutError:
+                logger.warning("Session eviction timed out")
+
+    async def _evict(self, thread: _Thread) -> None:
+        try:
+            await thread.session.disconnect()
+            thread.session = None
+            thread.mapper = None
+            thread.queue = asyncio.Queue()
+            thread.state = None
+        except Exception:
+            logger.warning("Session eviction failed", exc_info=True)
+        finally:
+            thread.eviction = None
 
     def _bind(self, thread: _Thread, tool: AGUITool) -> Tool:
         """Server-side handlers get the AG-UI run context; handler-less tools pause."""
@@ -271,7 +325,48 @@ class CopilotAgent:
             options["system_message"] = {"mode": "append", "content": self.instructions}
         options.update(_byok_provider())
         options.update(self.session_options)
+        if thread.session_id is not None:
+            resume = getattr(self.client, "resume_session", None)
+            if resume is None:
+                raise RuntimeError("Copilot client does not support session recovery")
+            options.pop("session_id", None)
+            options.pop("cloud", None)
+            return await resume(thread.session_id, **options)
         return await self.client.create_session(**options)
+
+    async def _open_session(self, thread: _Thread, input_data: RunAgentInput, deadline: float):
+        accepting = True
+
+        async def open_and_guard():
+            session = await self._create_session(thread, input_data)
+            if not accepting or thread.closed:
+                try:
+                    await session.disconnect()
+                except Exception:
+                    logger.warning("Late session cleanup failed", exc_info=True)
+                raise RuntimeError("Session opening abandoned")
+            thread.session = session
+            thread.session_id = session.session_id
+            return session
+
+        opening = thread.opening = asyncio.create_task(open_and_guard())
+
+        def settled(task):
+            if thread.opening is task:
+                thread.opening = None
+            if not task.cancelled():
+                task.exception()  # Observe a late failure after the run has already timed out.
+
+        opening.add_done_callback(settled)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(opening), max(deadline - asyncio.get_running_loop().time(), 0)
+            )
+        except TimeoutError as exc:
+            message = "Session recovery timed out" if thread.session_id else "Session creation timed out"
+            raise TimeoutError(message) from exc
+        finally:
+            accepting = False
 
     async def _resolve_pending(self, thread: _Thread, message: Any) -> None:
         call = thread.pending.pop(message.tool_call_id)
@@ -333,37 +428,49 @@ class CopilotAgent:
 
         thread = self._threads.get(input_data.thread_id)
         if thread is None:
-            if len(self._threads) >= MAX_THREADS:
-                await self._dispose(next(iter(self._threads)))
             thread = self._threads[input_data.thread_id] = _Thread()
         if thread.busy:
             raise RuntimeError("Thread already has an active run")
         thread.busy = True
-        thread.state = input_data.state
-
-        yield RunStartedEvent(thread_id=input_data.thread_id, run_id=input_data.run_id)
-        for event in thread.mapper.resume():
-            yield event
-        if self.predict_state:
-            yield CustomEvent(name="PredictState", value=self.predict_state)
-
-        # Only results resolving a call this process still holds are actionable;
-        # AG-UI clients replay the whole transcript on every run.
-        results = [
-            message
-            for message in input_data.messages
-            if message.role == "tool" and message.tool_call_id in thread.pending
-        ]
-        users = [message for message in input_data.messages if message.role == "user"]
-        last_user = users[-1] if users else None
-        new_user = (
-            _user_input(last_user.content)
-            if last_user is not None and last_user.id not in thread.sent_user_ids
-            else None
-        )
 
         failed = False
+        mapper = None
         try:
+            yield RunStartedEvent(thread_id=input_data.thread_id, run_id=input_data.run_id)
+            transitions = [t for t in (thread.eviction, thread.opening) if t is not None]
+            if transitions:
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.gather(*transitions, return_exceptions=True)),
+                    max(deadline - loop.time(), 0),
+                )
+            if thread.closed:
+                raise RuntimeError("Run cancelled")
+            if thread.session is None:
+                thread.queue = asyncio.Queue()
+            if thread.mapper is None:
+                thread.mapper = EventMapper()
+            mapper = thread.mapper
+            thread.state = input_data.state
+            for event in mapper.resume():
+                yield event
+            if self.predict_state:
+                yield CustomEvent(name="PredictState", value=self.predict_state)
+
+            # Only results resolving a call this process still holds are actionable;
+            # AG-UI clients replay the whole transcript on every run.
+            results = [
+                message
+                for message in input_data.messages
+                if message.role == "tool" and message.tool_call_id in thread.pending
+            ]
+            users = [message for message in input_data.messages if message.role == "user"]
+            last_user = users[-1] if users else None
+            new_user = (
+                _user_input(last_user.content)
+                if last_user is not None and last_user.id not in thread.sent_user_ids
+                else None
+            )
+
             for entry in input_data.resume or []:
                 if entry.interrupt_id not in thread.pending:
                     raise RuntimeError("Unknown or expired interrupt")
@@ -379,12 +486,14 @@ class CopilotAgent:
                             ),
                         )
                     )
-            if thread.session is None and any(m.role == "tool" for m in input_data.messages):
+            if thread.session_id is None and any(m.role == "tool" for m in input_data.messages):
                 raise RuntimeError("Pending tool session was lost; start a new thread")
             if thread.session is None:
-                thread.session = await asyncio.wait_for(
-                    self._create_session(thread, input_data), self.run_timeout
-                )
+                thread.session = await self._open_session(thread, input_data, deadline)
+                thread.session_id = thread.session.session_id
+            await self._trim()
+            if thread.closed:
+                raise RuntimeError("Run cancelled")
 
             if results:
                 await asyncio.wait_for(
@@ -406,9 +515,9 @@ class CopilotAgent:
                 )
             else:
                 # Nothing new to do: a replayed transcript with no unresolved work.
-                for event in thread.mapper.finish():
+                for event in mapper.finish():
                     yield event
-                for event in thread.mapper.suspend():
+                for event in mapper.suspend():
                     yield event
                 yield RunFinishedEvent(
                     thread_id=input_data.thread_id,
@@ -446,14 +555,14 @@ class CopilotAgent:
                         data.get("arguments"),
                         raw.get("agentId"),
                     )
-                for event in thread.mapper.map_event(raw):
+                for event in mapper.map_event(raw):
                     yield event
                 if kind == "session.idle" and not raw.get("agentId") and not thread.pending:
                     break
 
-            for event in thread.mapper.finish():
+            for event in mapper.finish():
                 yield event
-            for event in thread.mapper.suspend():
+            for event in mapper.suspend():
                 yield event
             yield RunFinishedEvent(
                 thread_id=input_data.thread_id,
@@ -465,12 +574,18 @@ class CopilotAgent:
             raise
         except Exception as exc:  # noqa: BLE001 -- surfaced to the client as RUN_ERROR.
             failed = True
-            for event in thread.mapper.finish():
+            for event in mapper.finish() if mapper is not None else []:
                 yield event
             yield RunErrorEvent(message=str(exc) or type(exc).__name__, code="COPILOT_SDK_ERROR")
         finally:
             thread.busy = False
-            # A failed run leaves the native session in an unknown state; drop it
-            # rather than leaking the thread and its suspended RPCs.
             if failed:
-                await self._dispose(input_data.thread_id)
+                if (thread.session is not None and mapper is not None) or (
+                    thread.session_id is None and thread.opening is None
+                ):
+                    await self._dispose(input_data.thread_id, thread)
+                elif thread.session is None:
+                    thread.mapper = None
+                    thread.queue = asyncio.Queue()
+                    thread.state = None
+            await self._trim()

@@ -1,11 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 import { firstValueFrom, toArray } from "rxjs";
 import type { BaseEvent, RunAgentInput } from "@ag-ui/core";
-import type { SessionConfig, SessionEvent } from "@github/copilot-sdk";
-import { CopilotAgent, type CopilotClientPort, type CopilotSessionPort } from "../src/index.js";
+import type { ResumeSessionConfig, SessionConfig, SessionEvent } from "@github/copilot-sdk";
+import { CopilotAgent, type CopilotClientPort, type CopilotSessionPort, type ToolContext } from "../src/index.js";
 import { CopilotEventMapper } from "../src/mapper.js";
 
 type Payload = { id: string; type: string; agentId?: string; data?: Record<string, unknown> };
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 const TEXT_TURN: Payload[] = [
   { id: "1", type: "assistant.message_start", data: { messageId: "m1" } },
@@ -30,6 +36,9 @@ const FRONTEND_TOOL_TURN: Payload[] = [
 class FakeClient implements CopilotClientPort {
   session?: FakeSession;
   config?: SessionConfig;
+  sessions: FakeSession[] = [];
+  history = new Map<string, string[]>();
+  resumedIds: string[] = [];
   constructor(
     private readonly script: Payload[],
     private readonly stall = false,
@@ -37,6 +46,23 @@ class FakeClient implements CopilotClientPort {
   async createSession(config: SessionConfig): Promise<CopilotSessionPort> {
     this.config = config;
     this.session = new FakeSession(config.onEvent!, this.script, this.stall);
+    this.session.sessionId = `session-${this.history.size + 1}`;
+    this.history.set(this.session.sessionId, this.session.prompts);
+    this.sessions.push(this.session);
+    return this.session as unknown as CopilotSessionPort;
+  }
+  async resumeSession(sessionId: string, config: ResumeSessionConfig): Promise<CopilotSessionPort> {
+    const history = this.history.get(sessionId);
+    if (!history) throw new Error("Session not found");
+    if (this.sessions.some((s) => s.sessionId === sessionId && !s.disconnected)) {
+      throw new Error("Session is still attached");
+    }
+    this.config = config;
+    this.resumedIds.push(sessionId);
+    this.session = new FakeSession(config.onEvent!, this.script, this.stall);
+    this.session.sessionId = sessionId;
+    this.session.prompts = history;
+    this.sessions.push(this.session);
     return this.session as unknown as CopilotSessionPort;
   }
 }
@@ -48,6 +74,7 @@ class FakeSession {
   resolved: string[] = [];
   aborted = false;
   disconnected = false;
+  sendStarted = deferred();
   rpc = {
     tools: {
       handlePendingToolCall: async ({ requestId, result }: { requestId: string; result: unknown }) => {
@@ -68,8 +95,10 @@ class FakeSession {
     this.onEvent(payload as never);
   }
   async send(options: Parameters<CopilotSessionPort["send"]>[0]): Promise<void> {
+    if (this.disconnected) throw new Error("Session is disconnected");
     this.prompts.push(options.prompt);
     this.sent.push(options);
+    this.sendStarted.resolve();
     if (this.stall) await new Promise(() => {});
     for (const payload of this.script) this.emit(payload);
   }
@@ -97,11 +126,313 @@ function makeInput(overrides: Partial<RunAgentInput> = {}): RunAgentInput {
 const run = (agent: CopilotAgent, input: RunAgentInput): Promise<BaseEvent[]> =>
   firstValueFrom(agent.run(input).pipe(toArray()));
 
+async function startHeld(agent: CopilotAgent, client: FakeClient, input = makeInput()) {
+  const created = deferred();
+  const create = client.createSession.bind(client);
+  const spy = vi.spyOn(client, "createSession").mockImplementationOnce(async (config) => {
+    const session = await create(config);
+    created.resolve();
+    return session;
+  });
+  const result = run(agent, input);
+  await created.promise;
+  const session = client.session!;
+  await session.sendStarted.promise;
+  spy.mockRestore();
+  return { result, session };
+}
+
 const TOOLS = [
   { name: "change_background", description: "change it", parameters: { type: "object", properties: {} } },
 ];
 
 describe("CopilotAgent", () => {
+  it("does not evict the oldest thread while its run is streaming", async () => {
+    const client = new FakeClient([]);
+    const agent = new CopilotAgent({ client, maxThreads: 2, runTimeoutMs: 5_000 });
+    const { result: first, session: active } = await startHeld(agent, client);
+    try {
+      for (let i = 2; i <= 3; i++) {
+        await run(agent, makeInput({ threadId: `t${i}`, messages: [] }));
+      }
+      expect(active.aborted).toBe(false);
+      expect(active.disconnected).toBe(false);
+      expect(client.sessions[1]!.disconnected).toBe(true);
+      expect(client.sessions[1]!.aborted).toBe(false);
+    } finally {
+      for (const event of TEXT_TURN) active.emit(event);
+      const events = await first;
+      expect(events.at(-1)!.type).toBe("RUN_FINISHED");
+      expect(events.some((event) => event.type === "TEXT_MESSAGE_CONTENT")).toBe(true);
+      await agent.close();
+    }
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity])("rejects invalid maxThreads %s", (maxThreads) => {
+    expect(() => new CopilotAgent({ client: new FakeClient([]), maxThreads })).toThrow(
+      "maxThreads must be a positive integer",
+    );
+  });
+
+  it("defaults to exactly 1000 resident sessions", async () => {
+    const client = new FakeClient([]);
+    const agent = new CopilotAgent({ client });
+    try {
+      for (let i = 0; i < 1000; i++) {
+        await run(agent, makeInput({ threadId: `thread-${i}`, messages: [] }));
+      }
+      expect(client.sessions.every((s) => !s.disconnected)).toBe(true);
+      await run(agent, makeInput({ threadId: "thread-1000", messages: [] }));
+      expect(client.sessions.filter((s) => !s.disconnected)).toHaveLength(1000);
+      expect(client.sessions[0]!.disconnected).toBe(true);
+      expect(client.sessions.every((s) => !s.aborted)).toBe(true);
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it("allows protected overflow across clones and trims when runs finish", async () => {
+    const client = new FakeClient([]);
+    const agent = new CopilotAgent({ client, maxThreads: 1 });
+    const first = await startHeld(agent, client);
+    const second = await startHeld(agent.clone(), client, makeInput({ threadId: "t2" }));
+    expect(client.sessions.every((s) => !s.disconnected && !s.aborted)).toBe(true);
+    first.session.emit({ id: "first-idle", type: "session.idle", data: {} });
+    expect((await first.result).at(-1)!.type).toBe("RUN_FINISHED");
+    expect(first.session.disconnected).toBe(true);
+    expect(second.session.disconnected).toBe(false);
+    second.session.emit({ id: "second-idle", type: "session.idle", data: {} });
+    expect((await second.result).at(-1)!.type).toBe("RUN_FINISHED");
+    expect(client.sessions.filter((s) => !s.disconnected)).toHaveLength(1);
+    await agent.close();
+  });
+
+  it.each(["frontend", "interrupt"])("protects pending %s work under cache pressure", async (kind) => {
+    const client = new FakeClient(FRONTEND_TOOL_TURN);
+    const agent = new CopilotAgent({
+      client, maxThreads: 1, tools: kind === "interrupt" ? TOOLS : [],
+      interrupts: kind === "interrupt" ? { change_background: (payload) => payload } : undefined,
+    });
+    const input = makeInput({ tools: kind === "frontend" ? TOOLS : [] });
+    await run(agent, input);
+    const protectedSession = client.session!;
+    await run(agent, makeInput({ threadId: "t2", messages: [] }));
+    expect(protectedSession.disconnected).toBe(false);
+    expect(protectedSession.aborted).toBe(false);
+    const events = await run(agent, {
+      ...input, runId: "r2",
+      ...(kind === "interrupt"
+        ? { resume: [{ interruptId: "call-1", status: "resolved", payload: "ok" }] }
+        : { messages: [...input.messages, { id: "answer", role: "tool", toolCallId: "call-1", content: "ok" }] }),
+    } as RunAgentInput);
+    expect(events.at(-1)!.type).toBe("RUN_FINISHED");
+    expect(protectedSession.resolved).toEqual(["req-1"]);
+    expect(client.resumedIds).toEqual([]);
+    await agent.close();
+  });
+
+  it("recovers native history across clones without replaying user or completed tool messages", async () => {
+    const client = new FakeClient(TEXT_TURN);
+    const create = vi.spyOn(client, "createSession");
+    const agent = new CopilotAgent({ client, maxThreads: 1 });
+    const firstInput = makeInput();
+    await run(agent, firstInput);
+    const original = client.session!;
+    const oldTool = { id: "old-result", role: "tool", toolCallId: "old-call", content: "done" } as const;
+    for (let i = 0; i < 2; i++) {
+      await run(agent.clone(), makeInput({ threadId: `other-${i}`, messages: [] }));
+      expect(original.disconnected).toBe(true);
+      const replay = await run(agent.clone(), {
+        ...firstInput, runId: `replay-${i}`, messages: [...firstInput.messages, oldTool],
+      });
+      expect(replay.at(-1)!.type).toBe("RUN_FINISHED");
+      expect(client.session!.sessionId).toBe(original.sessionId);
+      expect(client.session).not.toBe(original);
+      expect(client.session!.prompts).toEqual(["Say hello."]);
+      expect(client.session!.resolved).toEqual([]);
+    }
+    const next = await run(agent.clone(), makeInput({
+      runId: "next", state: { answer: 42 },
+      messages: [...firstInput.messages, oldTool, { id: "u2", role: "user", content: "Continue." }],
+    }));
+    expect(next.at(-1)!.type).toBe("RUN_FINISHED");
+    expect(next.some((event) => event.type === "TEXT_MESSAGE_CONTENT")).toBe(true);
+    expect(client.history.get(original.sessionId)).toHaveLength(2);
+    expect(client.history.get(original.sessionId)![1]).toContain("Continue.");
+    expect(client.resumedIds).toEqual([original.sessionId, original.sessionId]);
+    expect(create).toHaveBeenCalledTimes(3);
+    await agent.close();
+    await run(agent.clone(), makeInput({ messages: [] }));
+    expect(create).toHaveBeenCalledTimes(4);
+    expect(client.session!.sessionId).not.toBe(original.sessionId);
+    await agent.close();
+  });
+
+  it("waits for eviction before restoring, without duplicate detach or same-thread runs", async () => {
+    const client = new FakeClient(TEXT_TURN);
+    const agent = new CopilotAgent({ client, maxThreads: 1 });
+    await run(agent, makeInput());
+    const original = client.session!;
+    const entered = deferred();
+    const release = deferred();
+    const disconnect = original.disconnect.bind(original);
+    const spy = vi.spyOn(original, "disconnect").mockImplementation(async () => {
+      entered.resolve();
+      await release.promise;
+      await disconnect();
+    });
+    const other = run(agent, makeInput({ threadId: "other", messages: [] }));
+    await entered.promise;
+    const recovered = run(agent.clone(), makeInput({ runId: "return" }));
+    await expect(run(agent.clone(), makeInput({ runId: "overlap" }))).rejects.toThrow(
+      "Thread already has an active run",
+    );
+    const third = run(agent, makeInput({ threadId: "third", messages: [] }));
+    expect(client.resumedIds).toEqual([]);
+    release.resolve();
+    const events = await Promise.all([other, recovered, third]);
+    expect(events.every((e) => e.at(-1)!.type === "RUN_FINISHED")).toBe(true);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(client.resumedIds).toEqual([original.sessionId]);
+    await agent.close();
+  });
+
+  it("reports failed recovery without creating fresh history and can retry", async () => {
+    const client = new FakeClient(TEXT_TURN);
+    const agent = new CopilotAgent({ client, maxThreads: 1 });
+    await run(agent, makeInput());
+    const sessionId = client.session!.sessionId;
+    await run(agent, makeInput({ threadId: "other", messages: [] }));
+    const create = vi.spyOn(client, "createSession");
+    vi.spyOn(client, "resumeSession").mockRejectedValueOnce(new Error("Native resume unavailable"));
+    const failed = await run(agent, makeInput({ runId: "failed" }));
+    expect(failed.at(-1)).toMatchObject({ type: "RUN_ERROR", message: "Native resume unavailable" });
+    expect(create).not.toHaveBeenCalled();
+    expect((await run(agent, makeInput({ runId: "retry" }))).at(-1)!.type).toBe("RUN_FINISHED");
+    expect(client.resumedIds).toEqual([sessionId]);
+    await agent.close();
+  });
+
+  it("logs failed eviction and keeps its session usable", async () => {
+    const client = new FakeClient(TEXT_TURN);
+    const agent = new CopilotAgent({ client, maxThreads: 1 });
+    await run(agent, makeInput());
+    const original = client.session!;
+    const disconnect = vi.spyOn(original, "disconnect").mockRejectedValue(new Error("Detach unavailable"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await run(agent, makeInput({ threadId: "other", messages: [] }));
+      expect(original.aborted).toBe(false);
+      expect(original.disconnected).toBe(false);
+      expect(warning).toHaveBeenCalledWith("[copilot-sdk] Session eviction failed", expect.any(Error));
+      expect((await run(agent, makeInput({ runId: "same" }))).at(-1)!.type).toBe("RUN_FINISHED");
+      expect(client.resumedIds).toEqual([]);
+    } finally {
+      disconnect.mockRestore();
+      warning.mockRestore();
+      await agent.close();
+    }
+  });
+
+  it("closing a clone during recovery cannot restore cleared records", async () => {
+    const client = new FakeClient(TEXT_TURN);
+    const agent = new CopilotAgent({ client, maxThreads: 1 });
+    await run(agent, makeInput());
+    const originalId = client.session!.sessionId;
+    await run(agent, makeInput({ threadId: "other", messages: [] }));
+    const entered = deferred();
+    const release = deferred();
+    const resume = client.resumeSession.bind(client);
+    vi.spyOn(client, "resumeSession").mockImplementationOnce(async (id, config) => {
+      entered.resolve();
+      await release.promise;
+      return resume(id, config);
+    });
+    const pending = run(agent, makeInput({ runId: "return" }));
+    await entered.promise;
+    const closing = agent.clone().close();
+    release.resolve();
+    await closing;
+    expect((await pending).at(-1)!.type).toBe("RUN_ERROR");
+    expect(client.sessions.every((s) => s.disconnected)).toBe(true);
+    await run(agent.clone(), makeInput({ messages: [] }));
+    expect(client.session!.sessionId).not.toBe(originalId);
+    expect(client.resumedIds).toEqual([originalId]);
+    await agent.close();
+  });
+
+  it("reports missing recovery support for create-only clients", async () => {
+    const native = new FakeClient(TEXT_TURN);
+    const client = { createSession: vi.fn(native.createSession.bind(native)) };
+    const agent = new CopilotAgent({ client, maxThreads: 1 });
+    await run(agent, makeInput());
+    await run(agent, makeInput({ threadId: "other", messages: [] }));
+    const events = await run(agent, makeInput({ runId: "return" }));
+    expect(events.at(-1)).toMatchObject({
+      type: "RUN_ERROR", message: "Copilot client does not support session recovery",
+    });
+    expect(client.createSession).toHaveBeenCalledTimes(2);
+    await agent.close();
+  });
+
+  it("rebinds tools and session options on resume without create-only fields", async () => {
+    const client = new FakeClient(TEXT_TURN);
+    const onPermissionRequest = vi.fn(() => ({ kind: "denied-no-approval-rule" as const }));
+    const handler = vi.fn((_args: unknown, context: ToolContext) => {
+      context.setState({ recovered: true });
+      return "ok";
+    });
+    const agent = new CopilotAgent({
+      client, maxThreads: 1, tools: [{ name: "backend", handler }],
+      sessionConfig: { sessionId: "custom-create-id", onPermissionRequest, workingDirectory: "C:\\example" },
+    });
+    await run(agent, makeInput());
+    const originalHandler = client.config!.tools![0]!.handler;
+    await run(agent, makeInput({ threadId: "other", messages: [] }));
+    await run(agent, makeInput({ runId: "return" }));
+    expect(client.config!.sessionId).toBeUndefined();
+    expect(client.config!.onPermissionRequest).toBe(onPermissionRequest);
+    expect(client.config!.workingDirectory).toBe("C:\\example");
+    expect(client.config!.tools![0]!.handler).not.toBe(originalHandler);
+    expect(client.config!.onEvent).toBeTypeOf("function");
+    await agent.close();
+  });
+
+  it("cleans late recovery handles before retrying a timed-out resume", async () => {
+    vi.useFakeTimers();
+    const client = new FakeClient(TEXT_TURN);
+    const agent = new CopilotAgent({ client, maxThreads: 1, runTimeoutMs: 100 });
+    try {
+      await run(agent, makeInput());
+      const sessionId = client.session!.sessionId;
+      await run(agent, makeInput({ threadId: "other", messages: [] }));
+      const entered = deferred();
+      const release = deferred();
+      const resume = client.resumeSession.bind(client);
+      vi.spyOn(client, "resumeSession").mockImplementationOnce(async (id, config) => {
+        entered.resolve();
+        await release.promise;
+        return resume(id, config);
+      });
+      const pending = run(agent, makeInput({ runId: "slow" }));
+      await entered.promise;
+      await vi.advanceTimersByTimeAsync(100);
+      expect((await pending).at(-1)).toMatchObject({
+        type: "RUN_ERROR", message: "Session recovery timed out",
+      });
+      const retry = run(agent, makeInput({ runId: "retry" }));
+      release.resolve();
+      expect((await retry).at(-1)!.type).toBe("RUN_FINISHED");
+      const resumed = client.sessions.filter((s) => s.sessionId === sessionId);
+      expect(resumed).toHaveLength(3);
+      expect(resumed[1]!.disconnected).toBe(true);
+      expect(resumed[2]!.disconnected).toBe(false);
+    } finally {
+      await agent.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("streams assistant text", async () => {
     const events = await run(new CopilotAgent({ client: new FakeClient(TEXT_TURN), runTimeoutMs: 1_000 }), makeInput());
     expect(events[0]!.type).toBe("RUN_STARTED");
@@ -295,20 +626,24 @@ describe("CopilotAgent", () => {
       try {
         if (timing === "before waiting") subscription.unsubscribe();
         await vi.advanceTimersByTimeAsync(0);
-        const cancelledSession = client.session!;
-        expect(cancelledSession.prompts).toHaveLength(1);
+        const cancelledSession = client.session;
+        // Cancellation before session acquisition should avoid native work entirely.
+        if (timing === "before waiting") expect(cancelledSession).toBeUndefined();
+        else expect(cancelledSession!.prompts).toHaveLength(1);
 
         if (timing !== "before waiting") {
           expect(vi.getTimerCount()).toBe(1);
           if (timing === "after event wake") {
-            cancelledSession.emit({ id: "idle", type: "session.idle", data: {} });
+            cancelledSession!.emit({ id: "idle", type: "session.idle", data: {} });
           }
           subscription.unsubscribe();
           await vi.advanceTimersByTimeAsync(0);
         }
 
-        expect(cancelledSession.aborted).toBe(true);
-        expect(cancelledSession.disconnected).toBe(true);
+        if (cancelledSession) {
+          expect(cancelledSession.aborted).toBe(true);
+          expect(cancelledSession.disconnected).toBe(true);
+        }
         expect(vi.getTimerCount()).toBe(0);
 
         const retry = run(agent, makeInput({ runId: "r2" }));

@@ -26,6 +26,26 @@ add_copilot_fastapi_endpoint(app=app, agent=agent, path="/agentic_chat")
 `add_copilot_fastapi_endpoint` registers the agent route plus a `/health` route,
 and forwards extra keyword arguments to `app.post`.
 
+## Session retention
+
+Pass `max_threads=1000` (the default) to configure the positive-integer
+live-session retention target. This is a soft limit per `CopilotAgent`:
+active runs and sessions awaiting frontend-tool or interrupt results are
+protected. New work may exceed the target temporarily; eligible idle sessions
+are disconnected as runs finish.
+
+When an evicted thread returns, the adapter calls `resume_session` with its
+original native session ID, without resending old user messages or completed
+tool results. Custom clients must provide that method. Missing native history
+or a failed resume produces `RUN_ERROR`, not a replacement conversation.
+Applicable `session_options` and tool/event handlers are supplied again on
+resume; create-only `session_id` and `cloud` options are excluded.
+
+Recovery IDs and sent-message IDs stay in memory until `close()` and grow with
+the conversations seen; the limit does not bound these records or native disk
+storage. Recovery only works within the same agent process, not across restarts
+or pods. See [session retention and recovery](../README.md#session-retention-and-recovery).
+
 ## Features
 
 - **One native session per thread** — reused across runs, so the model keeps its turn context

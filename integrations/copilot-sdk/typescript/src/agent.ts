@@ -10,6 +10,7 @@ import {
 import { AbstractAgent, type AgentConfig } from "@ag-ui/client";
 import type {
   CopilotSession,
+  ResumeSessionConfig,
   SessionConfig,
   SessionEvent,
   Tool,
@@ -28,6 +29,7 @@ export type CopilotSessionPort = Pick<
 
 export interface CopilotClientPort {
   createSession(config: SessionConfig): Promise<CopilotSessionPort>;
+  resumeSession?(sessionId: string, config: ResumeSessionConfig): Promise<CopilotSessionPort>;
 }
 
 /** What a server-side tool handler gets besides its arguments. */
@@ -72,6 +74,8 @@ export interface CopilotAgentConfig extends AgentConfig {
   runTimeoutMs?: number;
   /** Bounds the in-process pending-tool registry. */
   maxPendingTools?: number;
+  /** Live-session retention target; active runs and pending tools may exceed it. */
+  maxThreads?: number;
 }
 
 interface PendingCall {
@@ -89,7 +93,11 @@ interface EmittedEvent {
 
 interface Thread {
   session?: CopilotSessionPort;
-  mapper: CopilotEventMapper;
+  sessionId?: string;
+  mapper?: CopilotEventMapper;
+  opening?: Promise<CopilotSessionPort>;
+  eviction?: Promise<void>;
+  closed?: boolean;
   /** AG-UI toolCallId -> the suspended external tool call this process still holds. */
   pending: Map<string, PendingCall>;
   sentUserIds: Set<string>;
@@ -101,8 +109,6 @@ interface Thread {
 
 type Attachment = NonNullable<Parameters<CopilotSession["send"]>[0]["attachments"]>[number];
 
-/** Native sessions are process-local; a restart drops suspended tool calls. */
-const MAX_THREADS = 32;
 /** Quiet period after a pending tool request before handing off to the browser. */
 const HANDOFF_DELAY_MS = 50;
 
@@ -185,6 +191,10 @@ export class CopilotAgent extends AbstractAgent {
 
   constructor(config: CopilotAgentConfig) {
     super(config);
+    const maxThreads = config.maxThreads === undefined ? 1000 : config.maxThreads;
+    if (!Number.isInteger(maxThreads) || maxThreads < 1) {
+      throw new RangeError("maxThreads must be a positive integer");
+    }
     this.config = config;
   }
 
@@ -200,12 +210,50 @@ export class CopilotAgent extends AbstractAgent {
     await Promise.allSettled([...this.threads.keys()].map((id) => this.dispose(id)));
   }
 
-  private async dispose(threadId: string): Promise<void> {
-    const thread = this.threads.get(threadId);
-    this.threads.delete(threadId);
-    if (!thread?.session) return;
+  private async dispose(threadId: string, thread = this.threads.get(threadId)): Promise<void> {
+    if (!thread) return;
+    thread.closed = true;
+    if (this.threads.get(threadId) === thread) this.threads.delete(threadId);
+    if (thread.opening || thread.eviction) {
+      await this.withDeadline(
+        Promise.allSettled([thread.opening, thread.eviction]),
+        Date.now() + 5_000,
+        "Session cleanup timed out",
+      ).catch((error: unknown) => console.warn("[copilot-sdk] Session cleanup failed", error));
+    }
+    if (!thread.session) return;
     await thread.session.abort().catch(() => {});
     await thread.session.disconnect().catch(() => {});
+  }
+
+  private async trim(): Promise<void> {
+    // ponytail: scan recovery records too; index live entries if long histories make this costly.
+    let excess = [...this.threads.values()].filter((t) => t.session && !t.eviction).length
+      - (this.config.maxThreads ?? 1000);
+    const evictions: Promise<void>[] = [];
+    for (const thread of this.threads.values()) {
+      if (excess <= 0) break;
+      if (!thread.session || thread.busy || thread.pending.size || thread.eviction || thread.closed) continue;
+      const session = thread.session;
+      thread.eviction = Promise.resolve().then(async () => {
+        try {
+          await session.disconnect();
+          thread.session = undefined;
+          thread.mapper = undefined;
+          thread.events = [];
+          thread.state = undefined;
+        } catch (error) {
+          console.warn("[copilot-sdk] Session eviction failed", error);
+        } finally {
+          thread.eviction = undefined;
+        }
+      });
+      evictions.push(thread.eviction);
+      excess--;
+    }
+    await this.withDeadline(
+      Promise.all(evictions), Date.now() + 5_000, "Session eviction timed out",
+    ).catch((error: unknown) => console.warn("[copilot-sdk] Session eviction failed", error));
   }
 
   run(input: RunAgentInput): Observable<BaseEvent> {
@@ -230,12 +278,7 @@ export class CopilotAgent extends AbstractAgent {
 
     let thread = this.threads.get(input.threadId);
     if (!thread) {
-      if (this.threads.size >= MAX_THREADS) {
-        const oldest = this.threads.keys().next().value;
-        if (oldest !== undefined) await this.dispose(oldest);
-      }
       thread = {
-        mapper: new CopilotEventMapper(),
         pending: new Map(),
         sentUserIds: new Set(),
         events: [],
@@ -246,27 +289,35 @@ export class CopilotAgent extends AbstractAgent {
     }
     if (thread.busy) throw new Error("Thread already has an active run");
     thread.busy = true;
-    thread.state = input.state;
-
-    yield { type: E.RUN_STARTED, threadId: input.threadId, runId: input.runId };
-    yield* thread.mapper.resume();
-    if (this.config.predictState) {
-      yield { type: E.CUSTOM, name: "PredictState", value: this.config.predictState };
-    }
-
-    // Only results that resolve a call this process still holds are actionable;
-    // CopilotKit replays the whole transcript on every run.
-    const results = input.messages
-      .filter(isToolMessage)
-      .filter((message) => thread!.pending.has(message.toolCallId));
-    const lastUser = [...input.messages]
-      .reverse()
-      .find((message): message is UserMessage => message.role === "user");
-    const newUser =
-      lastUser && !thread.sentUserIds.has(lastUser.id) ? userInput(lastUser.content) : undefined;
 
     let failure: string | undefined;
+    let mapper: CopilotEventMapper | undefined;
     try {
+      yield { type: E.RUN_STARTED, threadId: input.threadId, runId: input.runId };
+      // A previous timed-out open still owns its native handle until late cleanup finishes.
+      await this.withDeadline(
+        Promise.allSettled([thread.eviction, thread.opening]), deadline, "Session transition timed out",
+      );
+      if (thread.closed || signal.aborted) throw new Error("Run cancelled");
+      if (!thread.session) thread.events = [];
+      mapper = thread.mapper ??= new CopilotEventMapper();
+      thread.state = input.state;
+      yield* mapper.resume();
+      if (this.config.predictState) {
+        yield { type: E.CUSTOM, name: "PredictState", value: this.config.predictState };
+      }
+
+      // Only results that resolve a call this process still holds are actionable;
+      // CopilotKit replays the whole transcript on every run.
+      const results = input.messages
+        .filter(isToolMessage)
+        .filter((message) => thread!.pending.has(message.toolCallId));
+      const lastUser = [...input.messages]
+        .reverse()
+        .find((message): message is UserMessage => message.role === "user");
+      const newUser =
+        lastUser && !thread.sentUserIds.has(lastUser.id) ? userInput(lastUser.content) : undefined;
+
       for (const entry of input.resume ?? []) {
         if (!thread.pending.has(entry.interruptId)) throw new Error("Unknown or expired interrupt");
         if (!results.some((result) => result.toolCallId === entry.interruptId)) {
@@ -276,16 +327,15 @@ export class CopilotAgent extends AbstractAgent {
           });
         }
       }
-      if (!thread.session && input.messages.some(isToolMessage)) {
+      if (!thread.sessionId && input.messages.some(isToolMessage)) {
         throw new Error("Pending tool session was lost; start a new thread");
       }
       if (!thread.session) {
-        thread.session = await this.withDeadline(
-          this.createSession(thread, input),
-          deadline,
-          "Session creation timed out",
-        );
+        thread.session = await this.openSession(thread, input, deadline, signal);
+        thread.sessionId = thread.session.sessionId;
       }
+      await this.trim();
+      if (thread.closed || signal.aborted) throw new Error("Run cancelled");
 
       if (results.length) {
         await this.withDeadline(
@@ -306,8 +356,8 @@ export class CopilotAgent extends AbstractAgent {
         );
       } else {
         // Nothing new to do: a replayed transcript with no unresolved work.
-        yield* thread.mapper.finish();
-        yield* thread.mapper.suspend();
+        yield* mapper.finish();
+        yield* mapper.suspend();
         yield { type: E.RUN_FINISHED, threadId: input.threadId, runId: input.runId, ...this.interruptOutcome(thread) };
         return;
       }
@@ -336,12 +386,12 @@ export class CopilotAgent extends AbstractAgent {
             thread.pending.set(toolCallId, { requestId, toolName, args, subagentRunId });
           }
         }
-        yield* thread.mapper.mapEvent(event);
+        yield* mapper.mapEvent(event);
         if (event.type === "session.idle" && !event.agentId && !thread.pending.size) break;
       }
 
-      yield* thread.mapper.finish();
-      yield* thread.mapper.suspend();
+      yield* mapper.finish();
+      yield* mapper.suspend();
       yield {
         type: E.RUN_FINISHED,
         threadId: input.threadId,
@@ -350,13 +400,21 @@ export class CopilotAgent extends AbstractAgent {
       };
     } catch (error) {
       failure = error instanceof Error ? error.message : String(error);
-      yield* thread.mapper.finish();
+      yield* mapper?.finish() ?? [];
       yield { type: E.RUN_ERROR, message: failure, code: "COPILOT_SDK_ERROR" };
     } finally {
       thread.busy = false;
-      // A failed run leaves the native session in an unknown state; drop it rather
-      // than leaking the thread's session and its suspended RPCs.
-      if (failure !== undefined) void this.dispose(input.threadId);
+      if (failure !== undefined) {
+        if ((thread.session && mapper) || (!thread.sessionId && !thread.opening)) {
+          void this.dispose(input.threadId, thread);
+        } else if (!thread.session) {
+          // Failed resume preserves the recovery record, not output from that attempt.
+          thread.mapper = undefined;
+          thread.events = [];
+          thread.state = undefined;
+        }
+      }
+      await this.trim();
     }
   }
 
@@ -417,7 +475,7 @@ export class CopilotAgent extends AbstractAgent {
       skipPermission: true,
     }));
     const tools = [...this.bindTools(thread), ...frontendTools];
-    return this.config.client.createSession({
+    const config: SessionConfig = {
       model: this.config.model ?? "gpt-5.4-mini",
       streaming: true,
       // Only the tools registered here, plus the `task` built-in when custom
@@ -433,7 +491,39 @@ export class CopilotAgent extends AbstractAgent {
         thread.events.push(event);
         thread.wake?.();
       },
-    } as SessionConfig);
+    };
+    if (thread.sessionId) {
+      if (!this.config.client.resumeSession) throw new Error("Copilot client does not support session recovery");
+      const { sessionId: _id, cloud: _cloud, ...resumeConfig } = config;
+      return this.config.client.resumeSession(thread.sessionId, resumeConfig);
+    }
+    return this.config.client.createSession(config);
+  }
+
+  private async openSession(
+    thread: Thread, input: RunAgentInput, deadline: number, signal: AbortSignal,
+  ): Promise<CopilotSessionPort> {
+    let accepting = true;
+    const opening = this.createSession(thread, input).then(async (session) => {
+      if (!accepting || thread.closed || signal.aborted) {
+        await session.disconnect().catch((error: unknown) =>
+          console.warn("[copilot-sdk] Late session cleanup failed", error));
+        throw new Error("Session opening abandoned");
+      }
+      thread.session = session;
+      thread.sessionId = session.sessionId;
+      return session;
+    });
+    thread.opening = opening;
+    const settled = () => { if (thread.opening === opening) thread.opening = undefined; };
+    void opening.then(settled, settled);
+    try {
+      return await this.withDeadline(
+        opening, deadline, thread.sessionId ? "Session recovery timed out" : "Session creation timed out",
+      );
+    } finally {
+      accepting = false;
+    }
   }
 
   private async resolvePending(thread: Thread, result: ToolMessage): Promise<void> {

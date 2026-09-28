@@ -12,6 +12,32 @@ Python and TypeScript.
 Both expose the same surface: one native Copilot session per AG-UI thread, with
 `agent.run(input)` streaming AG-UI events.
 
+## Session retention and recovery
+
+`maxThreads` (TypeScript) / `max_threads` (Python) optionally sets the
+live-session retention target, default **1000**. It must be a positive integer.
+The limit is per agent instance; TypeScript request clones share one registry.
+It is a soft limit, not a concurrency ceiling: active runs and sessions waiting
+for frontend-tool or interrupt results are never evicted to make room.
+If all sessions are protected, the registry temporarily exceeds the target and
+trims eligible idle sessions as runs finish.
+
+Capacity eviction disconnects the oldest eligible session without aborting it.
+The adapter releases its cached output and keeps the native session ID and
+already-sent message IDs. A later run on that thread resumes the original native
+session, restoring its SDK-persisted conversation without resending old user
+messages or completed tool results. Recovery requires the native session history
+to remain available; missing history or a failed resume produces `RUN_ERROR`,
+not a silent replacement conversation. Custom clients must implement
+`resumeSession` / `resume_session` to support recovery.
+
+Recovery records remain in memory until `close()` and grow with the conversations
+and message IDs seen; `maxThreads` does not bound that metadata or native disk
+storage. Recovery is limited to the same process and agent (or clone family).
+It does not survive a restart or route a continuation to another pod. Closing
+the agent clears its records and disconnects live sessions, but does not delete
+the native SDK's on-disk history.
+
 ## Frontend tools and the pending-tool mechanism
 
 This is the piece worth understanding. A tool registered with the Copilot SDK

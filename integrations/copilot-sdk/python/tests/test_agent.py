@@ -55,6 +55,8 @@ class FakeSession:
         self.attachments: list[Any] = []
         self.resolved: list[Any] = []
         self.aborted = False
+        self.disconnected = False
+        self.send_started = asyncio.Event()
         self._on_event = on_event
         self._script = script
         self._stall = stall
@@ -64,8 +66,11 @@ class FakeSession:
         self._on_event(FakeEvent(payload))
 
     async def send(self, prompt: str, *, attachments=None) -> None:
+        if self.disconnected:
+            raise RuntimeError("Session is disconnected")
         self.prompts.append(prompt)
         self.attachments.append(attachments)
+        self.send_started.set()
         if self._stall:
             await asyncio.Event().wait()  # Never resolves: models a wedged native RPC.
         for payload in self._script:
@@ -75,7 +80,7 @@ class FakeSession:
         self.aborted = True
 
     async def disconnect(self) -> None:
-        return None
+        self.disconnected = True
 
 
 class FakeClient:
@@ -84,10 +89,29 @@ class FakeClient:
         self._stall = stall
         self.session: FakeSession | None = None
         self.options: dict[str, Any] = {}
+        self.sessions: list[FakeSession] = []
+        self.history: dict[str, list[str]] = {}
+        self.resumed_ids: list[str] = []
 
     async def create_session(self, **options: Any) -> FakeSession:
         self.options = options
         self.session = FakeSession(options["on_event"], self._script, stall=self._stall)
+        self.session.session_id = f"session-{len(self.history) + 1}"
+        self.history[self.session.session_id] = self.session.prompts
+        self.sessions.append(self.session)
+        return self.session
+
+    async def resume_session(self, session_id: str, **options: Any) -> FakeSession:
+        if session_id not in self.history:
+            raise RuntimeError("Session not found")
+        if any(s.session_id == session_id and not s.disconnected for s in self.sessions):
+            raise RuntimeError("Session is still attached")
+        self.options = options
+        self.resumed_ids.append(session_id)
+        self.session = FakeSession(options["on_event"], self._script, stall=self._stall)
+        self.session.session_id = session_id
+        self.session.prompts = self.history[session_id]
+        self.sessions.append(self.session)
         return self.session
 
 
@@ -134,8 +158,343 @@ def make_input(**overrides: Any) -> RunAgentInput:
     return RunAgentInput.model_validate(payload)
 
 
-async def collect(agent: CopilotAgent, input_data: RunAgentInput) -> list[Any]:
-    return [event async for event in agent.run(input_data)]
+async def collect(
+    agent: CopilotAgent, input_data: RunAgentInput, started: asyncio.Event | None = None,
+) -> list[Any]:
+    events = []
+    async for event in agent.run(input_data):
+        events.append(event)
+        if started is not None and event.type == "RUN_STARTED":
+            started.set()
+    return events
+
+
+async def start_held(agent: CopilotAgent, client: FakeClient, **overrides):
+    created = asyncio.Event()
+    create = client.create_session
+
+    async def opening(**options):
+        session = await create(**options)
+        created.set()
+        return session
+
+    client.create_session = opening
+    task = asyncio.create_task(collect(agent, make_input(**overrides)))
+    await created.wait()
+    session = client.session
+    await session.send_started.wait()
+    client.create_session = create
+    return task, session
+
+
+async def test_does_not_evict_oldest_thread_while_streaming():
+    client = FakeClient([])
+    agent = CopilotAgent(client, max_threads=2, run_timeout=5)
+    first, active = await start_held(agent, client)
+    try:
+        for index in range(2, 4):
+            await collect(agent, make_input(threadId=f"t{index}", messages=[]))
+        assert not active.aborted
+        assert not active.disconnected
+        assert client.sessions[1].disconnected
+        assert not client.sessions[1].aborted
+    finally:
+        for event in TEXT_TURN:
+            active.emit(event)
+        events = await first
+        assert events[-1].type == "RUN_FINISHED"
+        assert any(event.type == "TEXT_MESSAGE_CONTENT" for event in events)
+        await agent.close()
+
+
+@pytest.mark.parametrize("limit", [0, -1, 1.5, float("nan"), float("inf"), True, "2", None])
+def test_rejects_invalid_max_threads(limit):
+    with pytest.raises(ValueError, match="max_threads must be a positive integer"):
+        CopilotAgent(FakeClient([]), max_threads=limit)
+
+
+async def test_default_retains_exactly_1000_sessions():
+    client = FakeClient([])
+    agent = CopilotAgent(client)
+    try:
+        for index in range(1000):
+            await collect(agent, make_input(threadId=f"t{index}", messages=[]))
+        assert all(not s.disconnected for s in client.sessions)
+        await collect(agent, make_input(threadId="t1000", messages=[]))
+        assert sum(not s.disconnected for s in client.sessions) == 1000
+        assert client.sessions[0].disconnected
+        assert all(not s.aborted for s in client.sessions)
+    finally:
+        await agent.close()
+
+
+async def test_all_active_sessions_overflow_then_trim_on_completion():
+    client = FakeClient([])
+    agent = CopilotAgent(client, max_threads=1)
+    first, first_session = await start_held(agent, client)
+    second, second_session = await start_held(agent, client, threadId="t2")
+    assert all(not s.disconnected and not s.aborted for s in client.sessions)
+    first_session.emit({"id": "first-idle", "type": "session.idle", "data": {}})
+    assert (await first)[-1].type == "RUN_FINISHED"
+    assert first_session.disconnected
+    assert not second_session.disconnected
+    second_session.emit({"id": "second-idle", "type": "session.idle", "data": {}})
+    assert (await second)[-1].type == "RUN_FINISHED"
+    assert sum(not s.disconnected for s in client.sessions) == 1
+    await agent.close()
+
+
+@pytest.mark.parametrize("kind", ["frontend", "interrupt"])
+async def test_pending_work_is_protected_under_cache_pressure(kind):
+    client = FakeClient(FRONTEND_TOOL_TURN)
+    tool = {"name": "change_background", "description": "change it", "parameters": {}}
+    agent = CopilotAgent(
+        client, max_threads=1,
+        tools=[AGUITool("change_background")] if kind == "interrupt" else [],
+        interrupts={"change_background": lambda payload, args: payload} if kind == "interrupt" else {},
+    )
+    input_data = make_input(tools=[tool] if kind == "frontend" else [])
+    await collect(agent, input_data)
+    protected = client.session
+    await collect(agent, make_input(threadId="t2", messages=[]))
+    assert not protected.disconnected
+    assert not protected.aborted
+    continuation = (
+        {"resume": [{"interruptId": "call-1", "status": "resolved", "payload": "ok"}]}
+        if kind == "interrupt"
+        else {"messages": [
+            *input_data.messages,
+            {"id": "answer", "role": "tool", "toolCallId": "call-1", "content": "ok"},
+        ]}
+    )
+    events = await collect(agent, make_input(runId="r2", tools=input_data.tools, **continuation))
+    assert events[-1].type == "RUN_FINISHED"
+    assert [r.request_id for r in protected.resolved] == ["req-1"]
+    assert client.resumed_ids == []
+    await agent.close()
+
+
+async def test_recovers_native_history_without_replaying_old_input():
+    client = FakeClient(TEXT_TURN)
+    agent = CopilotAgent(client, max_threads=1)
+    input_data = make_input()
+    await collect(agent, input_data)
+    original = client.session
+    old_tool = {"id": "old-result", "role": "tool", "toolCallId": "old-call", "content": "done"}
+    for index in range(2):
+        await collect(agent, make_input(threadId=f"other-{index}", messages=[]))
+        assert original.disconnected
+        replay = await collect(agent, make_input(
+            runId=f"replay-{index}", messages=[*input_data.messages, old_tool],
+        ))
+        assert replay[-1].type == "RUN_FINISHED"
+        assert client.session.session_id == original.session_id
+        assert client.session is not original
+        assert client.session.prompts == ["Say hello."]
+        assert client.session.resolved == []
+    events = await collect(agent, make_input(
+        runId="next", state={"answer": 42},
+        messages=[
+            *input_data.messages, old_tool, {"id": "u2", "role": "user", "content": "Continue."},
+        ],
+    ))
+    assert events[-1].type == "RUN_FINISHED"
+    assert any(e.type == "TEXT_MESSAGE_CONTENT" for e in events)
+    assert len(client.history[original.session_id]) == 2
+    assert "Continue." in client.history[original.session_id][-1]
+    assert client.resumed_ids == [original.session_id, original.session_id]
+    assert len(client.history) == 3
+    await agent.close()
+    await collect(agent, make_input(messages=[]))
+    assert len(client.history) == 4
+    assert client.session.session_id != original.session_id
+    await agent.close()
+
+
+async def test_recovery_waits_for_eviction_without_duplicate_lifecycle_calls():
+    client = FakeClient(TEXT_TURN)
+    agent = CopilotAgent(client, max_threads=1)
+    await collect(agent, make_input())
+    original = client.session
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+    disconnect = original.disconnect
+
+    async def gated_disconnect():
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        await disconnect()
+
+    original.disconnect = gated_disconnect
+    other = asyncio.create_task(collect(agent, make_input(threadId="other", messages=[])))
+    await entered.wait()
+    started = asyncio.Event()
+    recovered = asyncio.create_task(collect(agent, make_input(runId="return"), started))
+    await started.wait()
+    with pytest.raises(RuntimeError, match="Thread already has an active run"):
+        await collect(agent, make_input(runId="overlap"))
+    third = asyncio.create_task(collect(agent, make_input(threadId="third", messages=[])))
+    assert client.resumed_ids == []
+    release.set()
+    events = await asyncio.gather(other, recovered, third)
+    assert all(e[-1].type == "RUN_FINISHED" for e in events)
+    assert calls == 1
+    assert client.resumed_ids == [original.session_id]
+    await agent.close()
+
+
+async def test_failed_resume_retains_recovery_record_for_retry():
+    client = FakeClient(TEXT_TURN)
+    agent = CopilotAgent(client, max_threads=1)
+    await collect(agent, make_input())
+    session_id = client.session.session_id
+    await collect(agent, make_input(threadId="other", messages=[]))
+    resume = client.resume_session
+
+    async def failing_resume(*args, **kwargs):
+        raise RuntimeError("Native resume unavailable")
+
+    client.resume_session = failing_resume
+    events = await collect(agent, make_input(runId="failed"))
+    assert events[-1].type == "RUN_ERROR"
+    assert events[-1].message == "Native resume unavailable"
+    assert len(client.history) == 2
+    client.resume_session = resume
+    assert (await collect(agent, make_input(runId="retry")))[-1].type == "RUN_FINISHED"
+    assert client.resumed_ids == [session_id]
+    await agent.close()
+
+
+async def test_create_only_client_reports_unsupported_recovery():
+    native = FakeClient(TEXT_TURN)
+    client = type("CreateOnly", (), {})()
+    client.create_session = native.create_session
+    agent = CopilotAgent(client, max_threads=1)
+    await collect(agent, make_input())
+    await collect(agent, make_input(threadId="other", messages=[]))
+    events = await collect(agent, make_input(runId="return"))
+    assert events[-1].type == "RUN_ERROR"
+    assert events[-1].message == "Copilot client does not support session recovery"
+    assert len(native.history) == 2
+    await agent.close()
+
+
+async def test_failed_eviction_is_logged_and_keeps_session_usable(caplog):
+    client = FakeClient(TEXT_TURN)
+    agent = CopilotAgent(client, max_threads=1)
+    await collect(agent, make_input())
+    original = client.session
+    disconnect = original.disconnect
+
+    async def failing_disconnect():
+        raise RuntimeError("Detach unavailable")
+
+    original.disconnect = failing_disconnect
+    try:
+        await collect(agent, make_input(threadId="other", messages=[]))
+        assert not original.aborted
+        assert not original.disconnected
+        assert "Session eviction failed" in caplog.text
+        assert (await collect(agent, make_input(runId="same")))[-1].type == "RUN_FINISHED"
+        assert client.resumed_ids == []
+    finally:
+        original.disconnect = disconnect
+        await agent.close()
+
+
+async def test_resume_rebinds_handlers_and_excludes_create_only_options():
+    client = FakeClient(TEXT_TURN)
+
+    def permission(*args):
+        return {"kind": "denied-no-approval-rule"}
+
+    def handler(args, context):
+        context.set_state({"recovered": True})
+        return "ok"
+
+    agent = CopilotAgent(
+        client, max_threads=1, tools=[AGUITool("backend", handler=handler)],
+        session_options={"session_id": "custom-create-id", "on_permission_request": permission,
+                         "working_directory": "C:\\example"},
+    )
+    await collect(agent, make_input())
+    original_handler = client.options["tools"][0].handler
+    await collect(agent, make_input(threadId="other", messages=[]))
+    await collect(agent, make_input(runId="return"))
+    assert "session_id" not in client.options
+    assert client.options["on_permission_request"] is permission
+    assert client.options["working_directory"] == "C:\\example"
+    assert client.options["tools"][0].handler is not original_handler
+    assert callable(client.options["on_event"])
+    await agent.close()
+
+
+async def test_close_during_resume_cannot_restore_cleared_records():
+    client = FakeClient(TEXT_TURN)
+    agent = CopilotAgent(client, max_threads=1)
+    await collect(agent, make_input())
+    original_id = client.session.session_id
+    await collect(agent, make_input(threadId="other", messages=[]))
+    entered, release, closing_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    resume = client.resume_session
+
+    async def gated_resume(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await resume(*args, **kwargs)
+
+    async def closing():
+        closing_started.set()
+        await agent.close()
+
+    client.resume_session = gated_resume
+    pending = asyncio.create_task(collect(agent, make_input(runId="return")))
+    await entered.wait()
+    close = asyncio.create_task(closing())
+    await closing_started.wait()
+    release.set()
+    await close
+    assert (await pending)[-1].type == "RUN_ERROR"
+    assert all(s.disconnected for s in client.sessions)
+    await collect(agent, make_input(messages=[]))
+    assert client.session.session_id != original_id
+    assert client.resumed_ids == [original_id]
+    await agent.close()
+
+
+async def test_late_resume_is_disconnected_before_retry():
+    client = FakeClient(TEXT_TURN)
+    agent = CopilotAgent(client, max_threads=1)
+    await collect(agent, make_input())
+    session_id = client.session.session_id
+    await collect(agent, make_input(threadId="other", messages=[]))
+    entered, release = asyncio.Event(), asyncio.Event()
+    resume = client.resume_session
+
+    async def gated_resume(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await resume(*args, **kwargs)
+
+    client.resume_session = gated_resume
+    agent.run_timeout = 0.05
+    pending = asyncio.create_task(collect(agent, make_input(runId="slow")))
+    await entered.wait()
+    events = await pending
+    assert events[-1].type == "RUN_ERROR"
+    assert events[-1].message == "Session recovery timed out"
+    agent.run_timeout = 5
+    client.resume_session = resume
+    retry = asyncio.create_task(collect(agent, make_input(runId="retry")))
+    release.set()
+    assert (await retry)[-1].type == "RUN_FINISHED"
+    resumed = [s for s in client.sessions if s.session_id == session_id]
+    assert len(resumed) == 3
+    assert resumed[1].disconnected
+    assert not resumed[2].disconnected
+    await agent.close()
 
 
 async def test_streams_assistant_text():

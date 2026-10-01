@@ -47,6 +47,7 @@ class FakeSession {
   sent: Parameters<CopilotSessionPort["send"]>[0][] = [];
   resolved: string[] = [];
   aborted = false;
+  disconnected = false;
   rpc = {
     tools: {
       handlePendingToolCall: async ({ requestId, result }: { requestId: string; result: unknown }) => {
@@ -75,7 +76,9 @@ class FakeSession {
   async abort(): Promise<void> {
     this.aborted = true;
   }
-  async disconnect(): Promise<void> {}
+  async disconnect(): Promise<void> {
+    this.disconnected = true;
+  }
 }
 
 function makeInput(overrides: Partial<RunAgentInput> = {}): RunAgentInput {
@@ -135,29 +138,95 @@ describe("CopilotAgent", () => {
     expect(prompt.endsWith("Say hello.")).toBe(true);
   });
 
-  it("hands off a frontend tool and resolves the original pending request", async () => {
+  it.each(["same instance", "request clones"])("hands off a frontend tool and resolves the original pending request (%s)", async (mode) => {
     const client = new FakeClient(FRONTEND_TOOL_TURN);
+    const createSession = vi.spyOn(client, "createSession");
     const agent = new CopilotAgent({ client, runTimeoutMs: 5_000 });
+    const firstAgent = mode === "request clones" ? agent.clone() : agent;
+    const secondAgent = mode === "request clones" ? agent.clone().clone() : agent;
+    try {
+      const first = await run(firstAgent, makeInput({ tools: TOOLS }));
+      const session = client.session!;
+      expect(first.at(-1)!.type).toBe("RUN_FINISHED");
+      expect(first.some((event) => event.type === "TOOL_CALL_START")).toBe(true);
+      expect(session.aborted).toBe(false);
+      expect(session.disconnected).toBe(false);
 
-    const first = await run(agent, makeInput({ tools: TOOLS } as Partial<RunAgentInput>));
-    expect(first.at(-1)!.type).toBe("RUN_FINISHED");
-    expect(first.some((event) => event.type === "TOOL_CALL_START")).toBe(true);
-
-    const second = await run(
-      agent,
-      makeInput({
-        runId: "r2",
-        tools: TOOLS,
+      const continuation = makeInput({
+        runId: "r2", tools: TOOLS,
         messages: [
           { id: "u1", role: "user", content: "Say hello." },
           { id: "t-1", role: "tool", toolCallId: "call-1", content: "ok" },
         ],
-      } as Partial<RunAgentInput>),
-    );
-    expect(second.at(-1)!.type).toBe("RUN_FINISHED");
-    // Resolved by native requestId, never re-prompted as user text.
-    expect(client.session!.resolved).toEqual(["req-1"]);
-    expect(client.session!.prompts).toHaveLength(1);
+      });
+      const second = await run(secondAgent, continuation);
+      expect(second.at(-1)!.type).toBe("RUN_FINISHED");
+      const replay = await run(mode === "request clones" ? agent.clone() : agent, { ...continuation, runId: "r3" });
+      expect(replay.at(-1)!.type).toBe("RUN_FINISHED");
+      expect(createSession).toHaveBeenCalledTimes(1);
+      expect(client.session).toBe(session);
+      // Resolved by native requestId, never re-prompted as user text.
+      expect(session.resolved).toEqual(["req-1"]);
+      expect(session.prompts).toHaveLength(1);
+    } finally {
+      await Promise.all([agent.close(), firstAgent.close(), secondAgent.close()]);
+    }
+  });
+
+  it("rejects overlapping same-thread runs across clones without aborting the first", async () => {
+    const client = new FakeClient(TEXT_TURN);
+    const createSession = vi.spyOn(client, "createSession");
+    const agent = new CopilotAgent({ client, runTimeoutMs: 1_000 });
+    const firstAgent = agent.clone();
+    const secondAgent = agent.clone();
+    const first = run(firstAgent, makeInput());
+    try {
+      await expect(run(secondAgent, makeInput({ runId: "overlap" }))).rejects.toThrow("Thread already has an active run");
+      expect((await first).at(-1)!.type).toBe("RUN_FINISHED");
+      expect(createSession).toHaveBeenCalledTimes(1);
+      expect(client.session!.aborted).toBe(false);
+      expect(client.session!.disconnected).toBe(false);
+    } finally {
+      await first;
+      await Promise.all([agent.close(), firstAgent.close(), secondAgent.close()]);
+    }
+  });
+
+  it.each(["original", "clone"])("closes the clone family through the %s without closing an independent agent", async (owner) => {
+    const client = new FakeClient(TEXT_TURN);
+    const createSession = vi.spyOn(client, "createSession");
+    const config = { client, runTimeoutMs: 1_000 };
+    const agent = new CopilotAgent(config);
+    const cloned = agent.clone();
+    const independent = new CopilotAgent(config);
+    try {
+      await run(cloned, makeInput());
+      const sharedSession = client.session!;
+      const abort = vi.spyOn(sharedSession, "abort");
+      const disconnect = vi.spyOn(sharedSession, "disconnect");
+      await run(independent, makeInput());
+      const independentSession = client.session!;
+      expect(independentSession).not.toBe(sharedSession);
+      expect(createSession).toHaveBeenCalledTimes(2);
+
+      await (owner === "original" ? agent : cloned).close();
+      expect(abort).toHaveBeenCalledTimes(1);
+      expect(disconnect).toHaveBeenCalledTimes(1);
+      expect(independentSession.aborted).toBe(false);
+      expect(independentSession.disconnected).toBe(false);
+      await agent.close();
+      await cloned.close();
+      expect(abort).toHaveBeenCalledTimes(1);
+      expect(disconnect).toHaveBeenCalledTimes(1);
+
+      const fresh = await run(cloned.clone(), makeInput({ runId: "fresh" }));
+      expect(fresh.at(-1)!.type).toBe("RUN_FINISHED");
+      expect(createSession).toHaveBeenCalledTimes(3);
+      expect(client.session).not.toBe(sharedSession);
+      expect(client.session).not.toBe(independentSession);
+    } finally {
+      await Promise.all([agent.close(), cloned.close(), independent.close()]);
+    }
   });
 
   it("forwards a frontend tool error as a failure result", async () => {
@@ -188,6 +257,49 @@ describe("CopilotAgent", () => {
     expect(events.at(-1)!.type).toBe("RUN_ERROR");
     expect(client.session!.aborted).toBe(true);
   });
+
+  it.each(["before waiting", "while waiting", "after event wake"])(
+    "cancels the event wait and allows a fresh same-thread run (%s)",
+    async (timing) => {
+      vi.useFakeTimers();
+      const client = new FakeClient([]);
+      const agent = new CopilotAgent({ client });
+      const subscription = agent.run(makeInput()).subscribe();
+      try {
+        if (timing === "before waiting") subscription.unsubscribe();
+        await vi.advanceTimersByTimeAsync(0);
+        const cancelledSession = client.session!;
+        expect(cancelledSession.prompts).toHaveLength(1);
+
+        if (timing !== "before waiting") {
+          expect(vi.getTimerCount()).toBe(1);
+          if (timing === "after event wake") {
+            cancelledSession.emit({ id: "idle", type: "session.idle", data: {} });
+          }
+          subscription.unsubscribe();
+          await vi.advanceTimersByTimeAsync(0);
+        }
+
+        expect(cancelledSession.aborted).toBe(true);
+        expect(cancelledSession.disconnected).toBe(true);
+        expect(vi.getTimerCount()).toBe(0);
+
+        const retry = run(agent, makeInput({ runId: "r2" }));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(client.session).not.toBe(cancelledSession);
+        client.session!.emit({ id: "retry-idle", type: "session.idle", data: {} });
+        expect((await retry).at(-1)!.type).toBe("RUN_FINISHED");
+        expect(client.session!.aborted).toBe(false);
+        expect(client.session!.disconnected).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        subscription.unsubscribe();
+        await vi.runAllTimersAsync();
+        await agent.close();
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it.each([
     ["tool.execution_start", true], ["external_tool.requested", true],

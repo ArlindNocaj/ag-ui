@@ -216,6 +216,19 @@ const LANES = {
     // so only the @ag-ui/* npm packages are published releases.
     note: "Java server builds from this checkout's Spring SDK; only @ag-ui/* npm deps are published",
   },
+  "copilot-sdk-python": {
+    // ag-ui-copilot-sdk is not on PyPI yet, so there is no release to switch
+    // the server to: it runs the adapter and its lockfile from this checkout.
+    // Once published, this becomes a `python` entry with that producer.
+    note: "ag-ui-copilot-sdk is not on PyPI yet; the server runs it from this checkout",
+  },
+  "copilot-sdk-typescript": {
+    // examples import ../dist (built from this checkout by prep), so the adapter
+    // runs from source; only its @ag-ui/* deps are published.
+    npm: ["@ag-ui/copilot-sdk"],
+    npmRoots: ["integrations/copilot-sdk/typescript"],
+    note: "adapter runs from source (examples import ../dist); @ag-ui/* deps are published",
+  },
   "claude-managed-agents-dotnet": {
     dotnet: {
       csproj: "integrations/claude-managed-agents/dotnet/examples/AGUIDojoServer/AGUIDojoServer.csproj",

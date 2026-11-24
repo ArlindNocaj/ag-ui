@@ -100,7 +100,7 @@ export default function getEnvVars(): envVars {
     claudeAgentSdkTypescriptUrl:
       process.env.CLAUDE_AGENT_SDK_TYPESCRIPT_URL || "http://localhost:8020",
     copilotSdkPythonUrl:
-      process.env.COPILOT_SDK_PYTHON_URL || "http://127.0.0.1:8031",
+      process.env.COPILOT_SDK_PYTHON_URL || "http://127.0.0.1:8033",
     copilotSdkTypescriptUrl:
       process.env.COPILOT_SDK_TYPESCRIPT_URL || "http://127.0.0.1:8032",
     claudeManagedAgentsDotnetUrl:
